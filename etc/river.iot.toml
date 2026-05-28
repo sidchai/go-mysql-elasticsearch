@@ -1,0 +1,142 @@
+# =============================================================================
+# go-mysql-elasticsearch 配置：api_request_record (saisiyun iot 项目)
+#
+# 关联文档：
+#   - 部署手册：iot_cloud_platform_server/api_request_record_es_deployment.md
+#   - ES 索引模板：iot_cloud_platform_server/scripts/es/index_template.json
+#   - ILM 策略：iot_cloud_platform_server/scripts/es/ilm_policy.json
+#   - 分表迁移：iot_cloud_platform_server/scripts/migrate_api_request_record_sharding.sql
+#
+# 设计要点：
+#   1. 源端：MySQL 64 分表 api_request_record_00 ~ _63，正则 api_request_record_[0-9]{2}
+#   2. 目标：ES 别名 api_request_record（写入索引由 ILM rollover 自动管理）
+#   3. 字段：MySQL snake_case → ES camelCase，filter 白名单排除 is_smart_card / deleted_at
+#   4. PK：MySQL 主键 id 直接作为 ES _id，分表数据汇聚到单一索引
+# =============================================================================
+
+# ----- MySQL 连接 -----
+# 复制账号需要权限：SELECT, REPLICATION SLAVE, REPLICATION CLIENT
+# 生产部署用环境变量覆盖：MY_ADDR / MY_USER / MY_PASS，见 cmd/main.go 的 flag
+my_addr = "127.0.0.1:3306"
+my_user = "canal"
+my_pass = "changeme"
+my_charset = "utf8mb4"
+
+# ----- Elasticsearch 连接 -----
+es_https = false
+es_addr = "127.0.0.1:9200"
+es_user = "elastic"
+es_pass = "changeme"
+
+# ----- 状态存储 -----
+# master.info 持久化 binlog 位点，断点续传依赖此目录
+# 生产建议挂载到独立磁盘卷，避免容器重启丢位点
+data_dir = "/var/lib/go-mysql-es-iot"
+
+# ----- 内置 HTTP 指标端点 -----
+# 暴露 /metrics（Prometheus 格式），含 mysql2es_inserted_num / canal_state / canal_delay
+stat_addr = "0.0.0.0:12800"
+stat_path = "/metrics"
+
+# ----- binlog 伪从配置 -----
+# server_id 全网唯一，避免与真实 slave / 其他 CDC 工具冲突
+# 建议命名规则：业务 ID + 实例序号，例如 iot 项目固定 50xx 段
+server_id = 5001
+flavor = "mysql"
+
+# ----- mysqldump 初次全量 -----
+# 历史数据通过 mysqldump 引导，需保证宿主存在 mysqldump 8.x 二进制
+# 4C8G 机器全量阶段会短暂占用 1-2GB 内存，过后释放
+mysqldump = "mysqldump"
+# 如果复制账号无 SUPER 权限（云数据库常见），需要 skip_master_data
+skip_master_data = false
+
+# ----- bulk 写入参数 -----
+# bulk_size = 2000：单批 2000 条，4G 机器实测内存峰值 < 200MB
+# flush_bulk_time = "500ms"：500ms 内必刷一次，保证端到端延迟 < 1s
+bulk_size = 2000
+flush_bulk_time = "500ms"
+
+# ----- 安全开关 -----
+skip_no_pk_table = false
+
+# =============================================================================
+# 数据源：MySQL 64 分表
+# RLIKE 模式 api_request_record_[0-9]{2} 同时覆盖 _00 ~ _99
+# 实际生产建表 _00 ~ _63，未来扩到 _99 不需要改配置
+# =============================================================================
+[[source]]
+schema = "iot_cloud"
+tables = ["api_request_record_[0-9]{2}"]
+
+# =============================================================================
+# 同步规则：64 分表 → 单 ES 索引别名
+# 别名 api_request_record 由 ILM rollover 自动指向当前 write index
+# =============================================================================
+[[rule]]
+schema = "iot_cloud"
+table = "api_request_record_[0-9]{2}"
+
+# ES 写入目标：别名 api_request_record（ILM 管理的 rollover 别名）
+# 经过 elastic/client.go 改造后，type 字段不再发往 ES，但保留配置不报错
+index = "api_request_record"
+type = "_doc"
+
+# 主键映射：默认用 MySQL PK 列 id
+# 不显式配置 id = [...]，沿用 TableInfo.PKColumns，避免不同分表 PK 冲突
+# id = ["id"]  # 取消注释也等价
+
+# 只同步白名单字段（MySQL snake_case 名）
+# 排除：
+#   - is_smart_card：iot_cloud_platform_open 内部字段，ES 模板未声明（dynamic: strict 会拒收）
+#   - deleted_at：软删标记，ES 端无对应字段
+filter = [
+    "id",
+    "account_id",
+    "record_id",
+    "device_no",
+    "data_type",
+    "request_type",
+    "callback_code",
+    "callback_elapsed_time",
+    "callback_msg",
+    "callback_time",
+    "callback_url",
+    "device_recv_time",
+    "device_reported_time",
+    "query_time",
+    "response_elapsed_time",
+    "response_time",
+    "request_message",
+    "response_message",
+    "msg_id",
+    "retry",
+    "created_at",
+    "updated_at",
+    "status",
+]
+
+# 字段映射：MySQL snake_case → ES camelCase
+# 与 scripts/es/index_template.json 的 properties 严格对齐
+# id / retry / status 因名字一致，无需映射
+[rule.field]
+account_id = "accountId"
+record_id = "recordId"
+device_no = "deviceNo"
+data_type = "dataType"
+request_type = "requestType"
+callback_code = "callbackCode"
+callback_elapsed_time = "callbackElapsedTime"
+callback_msg = "callbackMsg"
+callback_time = "callbackTime"
+callback_url = "callbackUrl"
+device_recv_time = "deviceRecvTime"
+device_reported_time = "deviceReportedTime"
+query_time = "queryTime"
+response_elapsed_time = "responseElapsedTime"
+response_time = "responseTime"
+request_message = "requestMessage"
+response_message = "responseMessage"
+msg_id = "msgId"
+created_at = "createdAt"
+updated_at = "updatedAt"

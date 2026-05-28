@@ -5,7 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 
@@ -55,10 +55,11 @@ func NewClient(conf *ClientConfig) *Client {
 }
 
 // ResponseItem is the ES item in the response.
+// Type 字段在 ES 7+ 不再返回，保留仅为反序列化兼容、老集群场景。
 type ResponseItem struct {
 	ID      string                 `json:"_id"`
 	Index   string                 `json:"_index"`
-	Type    string                 `json:"_type"`
+	Type    string                 `json:"_type,omitempty"`
 	Version int                    `json:"_version"`
 	Found   bool                   `json:"found"`
 	Source  map[string]interface{} `json:"_source"`
@@ -91,20 +92,20 @@ type BulkRequest struct {
 }
 
 func (r *BulkRequest) bulk(buf *bytes.Buffer) error {
+	// ES 7+ 已移除 _type，ES 9 完全不接受，这里不再写入 metaData
+	// r.Type 字段保留在结构体中仅为向后兼容，不参与请求构造
 	meta := make(map[string]map[string]string)
 	metaData := make(map[string]string)
 	if len(r.Index) > 0 {
 		metaData["_index"] = r.Index
-	}
-	if len(r.Type) > 0 {
-		metaData["_type"] = r.Type
 	}
 
 	if len(r.ID) > 0 {
 		metaData["_id"] = r.ID
 	}
 	if len(r.Parent) > 0 {
-		metaData["_parent"] = r.Parent
+		// ES 6+ 以 routing 替代已废弃的 _parent
+		metaData["routing"] = r.Parent
 	}
 	if len(r.Pipeline) > 0 {
 		metaData["pipeline"] = r.Pipeline
@@ -158,9 +159,10 @@ type BulkResponse struct {
 }
 
 // BulkResponseItem is the item in the bulk response.
+// Type 字段在 ES 7+ 不再返回，保留仅为反序列化兼容。
 type BulkResponseItem struct {
 	Index   string          `json:"_index"`
-	Type    string          `json:"_type"`
+	Type    string          `json:"_type,omitempty"`
 	ID      string          `json:"_id"`
 	Version int             `json:"_version"`
 	Status  int             `json:"status"`
@@ -185,12 +187,15 @@ type Mapping map[string]struct {
 }
 
 // DoRequest sends a request with body to ES.
+// 针对 ES 8/9 处理：增加 Accept compatible-with=8 头，
+// 保证能应对 ES 9.x 在严格模式下拒绝旧请求的场景。
 func (c *Client) DoRequest(method string, url string, body *bytes.Buffer) (*http.Response, error) {
 	req, err := http.NewRequest(method, url, body)
-	req.Header.Add("Content-Type", "application/json")
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/vnd.elasticsearch+json;compatible-with=8")
 	if len(c.User) > 0 && len(c.Password) > 0 {
 		req.SetBasicAuth(c.User, c.Password)
 	}
@@ -221,7 +226,7 @@ func (c *Client) Do(method string, url string, body map[string]interface{}) (*Re
 	ret := new(Response)
 	ret.Code = resp.StatusCode
 
-	data, err := ioutil.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -253,7 +258,7 @@ func (c *Client) DoBulk(url string, items []*BulkRequest) (*BulkResponse, error)
 	ret := new(BulkResponse)
 	ret.Code = resp.StatusCode
 
-	data, err := ioutil.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -286,19 +291,21 @@ func (c *Client) CreateMapping(index string, docType string, mapping map[string]
 		return errors.Errorf("Error: %s, code: %d", http.StatusText(r.Code), r.Code)
 	}
 
-	reqURL = fmt.Sprintf("%s://%s/%s/%s/_mapping", c.Protocol, c.Addr,
-		url.QueryEscape(index),
-		url.QueryEscape(docType))
+	// ES 7+ typeless API：/{index}/_mapping，docType 入参保留仅为签名兼容
+	_ = docType
+	reqURL = fmt.Sprintf("%s://%s/%s/_mapping", c.Protocol, c.Addr,
+		url.QueryEscape(index))
 
-	_, err = c.Do("POST", reqURL, mapping)
+	_, err = c.Do("PUT", reqURL, mapping)
 	return errors.Trace(err)
 }
 
 // GetMapping gets the mapping.
+// docType 入参保留仅为签名兼容，ES 7+ 已移除 type
 func (c *Client) GetMapping(index string, docType string) (*MappingResponse, error) {
-	reqURL := fmt.Sprintf("%s://%s/%s/%s/_mapping", c.Protocol, c.Addr,
-		url.QueryEscape(index),
-		url.QueryEscape(docType))
+	_ = docType
+	reqURL := fmt.Sprintf("%s://%s/%s/_mapping", c.Protocol, c.Addr,
+		url.QueryEscape(index))
 	buf := bytes.NewBuffer(nil)
 	resp, err := c.DoRequest("GET", reqURL, buf)
 
@@ -308,7 +315,7 @@ func (c *Client) GetMapping(index string, docType string) (*MappingResponse, err
 
 	defer resp.Body.Close()
 
-	data, err := ioutil.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -341,20 +348,22 @@ func (c *Client) DeleteIndex(index string) error {
 }
 
 // Get gets the item by id.
+// docType 入参保留仅为签名兼容，ES 7+ URL 统一为 /{index}/_doc/{id}
 func (c *Client) Get(index string, docType string, id string) (*Response, error) {
-	reqURL := fmt.Sprintf("%s://%s/%s/%s/%s", c.Protocol, c.Addr,
+	_ = docType
+	reqURL := fmt.Sprintf("%s://%s/%s/_doc/%s", c.Protocol, c.Addr,
 		url.QueryEscape(index),
-		url.QueryEscape(docType),
 		url.QueryEscape(id))
 
 	return c.Do("GET", reqURL, nil)
 }
 
-// Update creates or updates the data
+// Update creates or updates the data.
+// docType 入参保留仅为签名兼容
 func (c *Client) Update(index string, docType string, id string, data map[string]interface{}) error {
-	reqURL := fmt.Sprintf("%s://%s/%s/%s/%s", c.Protocol, c.Addr,
+	_ = docType
+	reqURL := fmt.Sprintf("%s://%s/%s/_doc/%s", c.Protocol, c.Addr,
 		url.QueryEscape(index),
-		url.QueryEscape(docType),
 		url.QueryEscape(id))
 
 	r, err := c.Do("PUT", reqURL, data)
@@ -370,10 +379,11 @@ func (c *Client) Update(index string, docType string, id string, data map[string
 }
 
 // Exists checks whether id exists or not.
+// docType 入参保留仅为签名兼容
 func (c *Client) Exists(index string, docType string, id string) (bool, error) {
-	reqURL := fmt.Sprintf("%s://%s/%s/%s/%s", c.Protocol, c.Addr,
+	_ = docType
+	reqURL := fmt.Sprintf("%s://%s/%s/_doc/%s", c.Protocol, c.Addr,
 		url.QueryEscape(index),
-		url.QueryEscape(docType),
 		url.QueryEscape(id))
 
 	r, err := c.Do("HEAD", reqURL, nil)
@@ -385,10 +395,11 @@ func (c *Client) Exists(index string, docType string, id string) (bool, error) {
 }
 
 // Delete deletes the item by id.
+// docType 入参保留仅为签名兼容
 func (c *Client) Delete(index string, docType string, id string) error {
-	reqURL := fmt.Sprintf("%s://%s/%s/%s/%s", c.Protocol, c.Addr,
+	_ = docType
+	reqURL := fmt.Sprintf("%s://%s/%s/_doc/%s", c.Protocol, c.Addr,
 		url.QueryEscape(index),
-		url.QueryEscape(docType),
 		url.QueryEscape(id))
 
 	r, err := c.Do("DELETE", reqURL, nil)
@@ -419,11 +430,12 @@ func (c *Client) IndexBulk(index string, items []*BulkRequest) (*BulkResponse, e
 	return c.DoBulk(reqURL, items)
 }
 
-// IndexTypeBulk sends the bulk request for index and doc type.
+// IndexTypeBulk sends the bulk request for index.
+// ES 7+ typeless：docType 入参保留仅为签名兼容，实际走 /{index}/_bulk
 func (c *Client) IndexTypeBulk(index string, docType string, items []*BulkRequest) (*BulkResponse, error) {
-	reqURL := fmt.Sprintf("%s://%s/%s/%s/_bulk", c.Protocol, c.Addr,
-		url.QueryEscape(index),
-		url.QueryEscape(docType))
+	_ = docType
+	reqURL := fmt.Sprintf("%s://%s/%s/_bulk", c.Protocol, c.Addr,
+		url.QueryEscape(index))
 
 	return c.DoBulk(reqURL, items)
 }

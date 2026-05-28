@@ -7,10 +7,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-mysql-org/go-mysql/client"
+	"github.com/go-mysql-org/go-mysql/mysql"
 	. "github.com/pingcap/check"
-	"github.com/siddontang/go-mysql-elasticsearch/elastic"
-	"github.com/siddontang/go-mysql/client"
-	"github.com/siddontang/go-mysql/mysql"
+	"github.com/sidchai/go-mysql-elasticsearch/elastic"
 )
 
 var myAddr = flag.String("my_addr", "127.0.0.1:3306", "MySQL addr")

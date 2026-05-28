@@ -8,13 +8,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-mysql-org/go-mysql/canal"
+	"github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/replication"
+	"github.com/go-mysql-org/go-mysql/schema"
 	"github.com/juju/errors"
+	"github.com/sidchai/go-mysql-elasticsearch/elastic"
 	"github.com/siddontang/go-log/log"
-	"github.com/siddontang/go-mysql-elasticsearch/elastic"
-	"github.com/siddontang/go-mysql/canal"
-	"github.com/siddontang/go-mysql/mysql"
-	"github.com/siddontang/go-mysql/replication"
-	"github.com/siddontang/go-mysql/schema"
 )
 
 const (
@@ -35,7 +35,9 @@ type eventHandler struct {
 	r *River
 }
 
-func (h *eventHandler) OnRotate(e *replication.RotateEvent) error {
+// OnRotate 处理 binlog 文件轮换事件。
+// go-mysql v1.x+ 在首参新增 *replication.EventHeader，这里未使用。
+func (h *eventHandler) OnRotate(_ *replication.EventHeader, e *replication.RotateEvent) error {
 	pos := mysql.Position{
 		Name: string(e.NextLogName),
 		Pos:  uint32(e.Position),
@@ -46,7 +48,8 @@ func (h *eventHandler) OnRotate(e *replication.RotateEvent) error {
 	return h.r.ctx.Err()
 }
 
-func (h *eventHandler) OnTableChanged(schema, table string) error {
+// OnTableChanged 表结构变更时触发，上游接口新增 header 首参。
+func (h *eventHandler) OnTableChanged(_ *replication.EventHeader, schema, table string) error {
 	err := h.r.updateRule(schema, table)
 	if err != nil && err != ErrRuleNotExist {
 		return errors.Trace(err)
@@ -54,12 +57,16 @@ func (h *eventHandler) OnTableChanged(schema, table string) error {
 	return nil
 }
 
-func (h *eventHandler) OnDDL(nextPos mysql.Position, _ *replication.QueryEvent) error {
+// OnDDL 处理 DDL 事件。
+// go-mysql v1.x+ 的 canal.EventHandler 接口在第一参数新增了 *replication.EventHeader，
+// 这里未使用 header，仅用于满足接口签名。
+func (h *eventHandler) OnDDL(_ *replication.EventHeader, nextPos mysql.Position, _ *replication.QueryEvent) error {
 	h.r.syncCh <- posSaver{nextPos, true}
 	return h.r.ctx.Err()
 }
 
-func (h *eventHandler) OnXID(nextPos mysql.Position) error {
+// OnXID 事务提交事件，新版接口新增 header 首参。
+func (h *eventHandler) OnXID(_ *replication.EventHeader, nextPos mysql.Position) error {
 	h.r.syncCh <- posSaver{nextPos, false}
 	return h.r.ctx.Err()
 }
@@ -93,11 +100,25 @@ func (h *eventHandler) OnRow(e *canal.RowsEvent) error {
 	return h.r.ctx.Err()
 }
 
-func (h *eventHandler) OnGTID(gtid mysql.GTIDSet) error {
+// OnGTID GTID 事件。
+// go-mysql v1.x+ 将原来的 mysql.GTIDSet 变更为 mysql.BinlogGTIDEvent，同时新增 header 首参。
+func (h *eventHandler) OnGTID(_ *replication.EventHeader, _ mysql.BinlogGTIDEvent) error {
 	return nil
 }
 
-func (h *eventHandler) OnPosSynced(pos mysql.Position, set mysql.GTIDSet, force bool) error {
+// OnPosSynced 位点同步事件，新增 header 首参。
+func (h *eventHandler) OnPosSynced(_ *replication.EventHeader, pos mysql.Position, set mysql.GTIDSet, force bool) error {
+	return nil
+}
+
+// OnRowsQueryEvent 当 binlog_rows_query_log_events=ON 时每条 DML 返回原始 SQL，这里不需要处理，
+// 返回 nil 即可。Go-mysql v1.x+ 新增接口，必须实现。
+func (h *eventHandler) OnRowsQueryEvent(_ *replication.RowsQueryEvent) error {
+	return nil
+}
+
+// OnTableNotFound 当 Rows Event 引用的表不存在时触发，默认忽略。
+func (h *eventHandler) OnTableNotFound(_ *replication.EventHeader, _ *replication.RowsEvent) error {
 	return nil
 }
 
@@ -187,7 +208,8 @@ func (r *River) makeRequest(rule *Rule, action string, rows [][]interface{}) ([]
 			}
 		}
 
-		req := &elastic.BulkRequest{Index: rule.Index, Type: rule.Type, ID: id, Parent: parentID, Pipeline: rule.Pipeline}
+		// ES 7+ 已移除 type，不再传 Type 字段
+		req := &elastic.BulkRequest{Index: rule.Index, ID: id, Parent: parentID, Pipeline: rule.Pipeline}
 
 		if action == canal.DeleteAction {
 			req.Action = elastic.ActionDelete
@@ -240,13 +262,14 @@ func (r *River) makeUpdateRequest(rule *Rule, rows [][]interface{}) ([]*elastic.
 			}
 		}
 
-		req := &elastic.BulkRequest{Index: rule.Index, Type: rule.Type, ID: beforeID, Parent: beforeParentID}
+		// ES 7+ 已移除 type，不再传 Type 字段
+		req := &elastic.BulkRequest{Index: rule.Index, ID: beforeID, Parent: beforeParentID}
 
 		if beforeID != afterID || beforeParentID != afterParentID {
 			req.Action = elastic.ActionDelete
 			reqs = append(reqs, req)
 
-			req = &elastic.BulkRequest{Index: rule.Index, Type: rule.Type, ID: afterID, Parent: afterParentID, Pipeline: rule.Pipeline}
+			req = &elastic.BulkRequest{Index: rule.Index, ID: afterID, Parent: afterParentID, Pipeline: rule.Pipeline}
 			r.makeInsertReqData(req, rule, rows[i+1])
 
 			esDeleteNum.WithLabelValues(rule.Index).Inc()

@@ -1,7 +1,7 @@
 package river
 
 import (
-	"io/ioutil"
+	"os"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -49,7 +49,7 @@ type Config struct {
 
 // NewConfigWithFile creates a Config from file.
 func NewConfigWithFile(name string) (*Config, error) {
-	data, err := ioutil.ReadFile(name)
+	data, err := os.ReadFile(name)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}

@@ -9,8 +9,8 @@ import (
 
 	"github.com/juju/errors"
 	"github.com/siddontang/go-log/log"
-	"github.com/siddontang/go-mysql-elasticsearch/elastic"
-	"github.com/siddontang/go-mysql/canal"
+	"github.com/go-mysql-org/go-mysql/canal"
+	"github.com/sidchai/go-mysql-elasticsearch/elastic"
 )
 
 // ErrRuleNotExist is the error if rule is not defined.

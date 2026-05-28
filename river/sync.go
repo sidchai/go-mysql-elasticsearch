@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
 
@@ -77,6 +79,10 @@ func (h *eventHandler) OnRow(e *canal.RowsEvent) error {
 		return nil
 	}
 
+	// 首次 OnRow 抵达意味着 binlog 端到端打通，此时才合适设同步状态 1，
+	// 避免与 P1-3 以前“未连上却报 1”的假阳状态冲突。
+	h.r.markRunning()
+
 	var reqs []*elastic.BulkRequest
 	var err error
 	switch e.Action {
@@ -95,7 +101,12 @@ func (h *eventHandler) OnRow(e *canal.RowsEvent) error {
 		return errors.Errorf("make %s ES request err %v, close sync", e.Action, err)
 	}
 
-	h.r.syncCh <- reqs
+	// P1-4：避免 syncCh 满后永久阻塞，ctx 取消时必须能退出。
+	select {
+	case h.r.syncCh <- reqs:
+	case <-h.r.ctx.Done():
+		return h.r.ctx.Err()
+	}
 
 	return h.r.ctx.Err()
 }
@@ -141,10 +152,21 @@ func (r *River) syncLoop() {
 	defer ticker.Stop()
 	defer r.wg.Done()
 
+	// P2-5：panic recover。任何意外（map nil、越界、类型断言失败）都不应该让进程裸奔，
+	// 同时抓住后要设 state=0、cancel 让 main 退出，避免假运行。
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Errorf("syncLoop panic: %v\n%s", rec, debug.Stack())
+			canalSyncState.Set(0)
+			r.cancel()
+		}
+	}()
+
 	lastSavedTime := time.Now()
 	reqs := make([]*elastic.BulkRequest, 0, 1024)
 
 	var pos mysql.Position
+	var lastKnownPos mysql.Position // 记录最后一个看到的位点，退出时 final flush 补上
 
 	for {
 		needFlush := false
@@ -154,6 +176,7 @@ func (r *River) syncLoop() {
 		case v := <-r.syncCh:
 			switch v := v.(type) {
 			case posSaver:
+				lastKnownPos = v.pos
 				now := time.Now()
 				if v.force || now.Sub(lastSavedTime) > 3*time.Second {
 					lastSavedTime = now
@@ -168,13 +191,26 @@ func (r *River) syncLoop() {
 		case <-ticker.C:
 			needFlush = true
 		case <-r.ctx.Done():
+			// P1-5：退出前做 final flush。reqs 里不丢在内存，ES 幂等写入，重启后不会重复追赶。
+			if len(reqs) > 0 {
+				if err := r.doBulk(reqs); err != nil {
+					log.Errorf("final flush bulk err: %v", err)
+				} else {
+					reqs = reqs[:0]
+				}
+			}
+			if lastKnownPos.Name != "" {
+				if err := r.master.SaveForce(lastKnownPos); err != nil {
+					log.Errorf("final save position %s err: %v", lastKnownPos, err)
+				}
+			}
 			return
 		}
 
 		if needFlush {
-			// TODO: retry some times?
 			if err := r.doBulk(reqs); err != nil {
 				log.Errorf("do ES bulk err %v, close sync", err)
+				canalSyncState.Set(0)
 				r.cancel()
 				return
 			}
@@ -184,6 +220,7 @@ func (r *River) syncLoop() {
 		if needSavePos {
 			if err := r.master.Save(pos); err != nil {
 				log.Errorf("save sync position %s err %v, close sync", pos, err)
+				canalSyncState.Set(0)
 				r.cancel()
 				return
 			}
@@ -372,40 +409,18 @@ func (r *River) makeReqColumnData(col *schema.TableColumn, value interface{}) in
 	return value
 }
 
-func (r *River) getFieldParts(k string, v string) (string, string, string) {
-	composedField := strings.Split(v, ",")
-
-	mysql := k
-	elastic := composedField[0]
-	fieldType := ""
-
-	if 0 == len(elastic) {
-		elastic = mysql
-	}
-	if 2 == len(composedField) {
-		fieldType = composedField[1]
-	}
-
-	return mysql, elastic, fieldType
-}
-
 func (r *River) makeInsertReqData(req *elastic.BulkRequest, rule *Rule, values []interface{}) {
 	req.Data = make(map[string]interface{}, len(values))
 	req.Action = elastic.ActionIndex
 
+	// P2-1：使用 prepare 阶段预编译的 compiled 快查表，避免热路径上重复解析 FieldMapping。
 	for i, c := range rule.TableInfo.Columns {
 		if !rule.CheckFilter(c.Name) {
 			continue
 		}
-		mapped := false
-		for k, v := range rule.FieldMapping {
-			mysql, elastic, fieldType := r.getFieldParts(k, v)
-			if mysql == c.Name {
-				mapped = true
-				req.Data[elastic] = r.getFieldValue(&c, fieldType, values[i])
-			}
-		}
-		if mapped == false {
+		if m, ok := rule.compiled[c.Name]; ok {
+			req.Data[m.esField] = r.getFieldValue(&c, m.fieldType, values[i])
+		} else {
 			req.Data[c.Name] = r.makeReqColumnData(&c, values[i])
 		}
 	}
@@ -419,7 +434,6 @@ func (r *River) makeUpdateReqData(req *elastic.BulkRequest, rule *Rule,
 	req.Action = elastic.ActionUpdate
 
 	for i, c := range rule.TableInfo.Columns {
-		mapped := false
 		if !rule.CheckFilter(c.Name) {
 			continue
 		}
@@ -427,17 +441,11 @@ func (r *River) makeUpdateReqData(req *elastic.BulkRequest, rule *Rule,
 			//nothing changed
 			continue
 		}
-		for k, v := range rule.FieldMapping {
-			mysql, elastic, fieldType := r.getFieldParts(k, v)
-			if mysql == c.Name {
-				mapped = true
-				req.Data[elastic] = r.getFieldValue(&c, fieldType, afterValues[i])
-			}
-		}
-		if mapped == false {
+		if m, ok := rule.compiled[c.Name]; ok {
+			req.Data[m.esField] = r.getFieldValue(&c, m.fieldType, afterValues[i])
+		} else {
 			req.Data[c.Name] = r.makeReqColumnData(&c, afterValues[i])
 		}
-
 	}
 }
 
@@ -488,26 +496,94 @@ func (r *River) getParentID(rule *Rule, row []interface{}, columnName string) (s
 	return fmt.Sprint(row[index]), nil
 }
 
+// doBulk 封装 ES bulk 写入与退避重试。
+// 原实现有两个致命问题：
+// 1. 判定写反为 `resp.Code/100 == 2 || resp.Errors`（应为 !=2），导致 5xx/4xx 被静默吞掉；
+// 2. 任意错误都返回 nil，外层 syncLoop 认为成功、推进 master.info 位点，最终造成数据丢失。
+// 这里重写后：
+//   - 仅 2xx 且 Errors=false 才认为成功；
+//   - 5xx / 网络错误 → 指数退避重试（默认 5 次，到顶后给外层 cancel）；
+//   - 4xx / Errors=true 但不包含可重试状态 → 记录指标 + 上报错误（调用方选择如何处理）。
 func (r *River) doBulk(reqs []*elastic.BulkRequest) error {
 	if len(reqs) == 0 {
 		return nil
 	}
 
-	if resp, err := r.es.Bulk(reqs); err != nil {
-		log.Errorf("sync docs err %v after binlog %s", err, r.canal.SyncedPosition())
-		return errors.Trace(err)
-	} else if resp.Code/100 == 2 || resp.Errors {
-		for i := 0; i < len(resp.Items); i++ {
-			for action, item := range resp.Items[i] {
-				if len(item.Error) > 0 {
-					log.Errorf("%s index: %s, type: %s, id: %s, status: %d, error: %s",
-						action, item.Index, item.Type, item.ID, item.Status, item.Error)
-				}
+	maxRetry := r.c.BulkMaxRetry
+	initialBackoff := r.c.BulkRetryInitialBackoff.Duration
+	maxBackoff := r.c.BulkRetryMaxBackoff.Duration
+	if initialBackoff <= 0 {
+		initialBackoff = time.Second
+	}
+	if maxBackoff <= 0 {
+		maxBackoff = 30 * time.Second
+	}
+
+	backoff := initialBackoff
+	var lastErr error
+	for attempt := 0; attempt <= maxRetry; attempt++ {
+		start := time.Now()
+		resp, err := r.es.Bulk(reqs)
+		esBulkDuration.Observe(time.Since(start).Seconds())
+
+		if err == nil && resp.Code/100 == 2 && !resp.Errors {
+			return nil
+		}
+
+		if err != nil {
+			lastErr = errors.Trace(err)
+			log.Errorf("bulk attempt %d/%d transport err: %v, pos=%s",
+				attempt+1, maxRetry+1, err, r.canal.SyncedPosition())
+		} else if resp.Code/100 == 5 {
+			lastErr = errors.Errorf("bulk http %d (server-side error)", resp.Code)
+			log.Errorf("bulk attempt %d/%d http %d, pos=%s",
+				attempt+1, maxRetry+1, resp.Code, r.canal.SyncedPosition())
+		} else if resp.Code/100 != 2 {
+			// 4xx 错误一般不可重试（如请求体不合法、index 设置不允许写入），直接返回
+			return errors.Errorf("bulk http %d (client-side, non-retriable)", resp.Code)
+		} else {
+			// 2xx 但 Errors=true：部分文档出错，逐条记录指标后返回错误（不重试避免反复写那些个已成功的）
+			failed := r.recordBulkErrors(resp)
+			if failed > 0 {
+				return errors.Errorf("bulk has %d failed items", failed)
 			}
+			return nil
+		}
+
+		if attempt >= maxRetry {
+			break
+		}
+		esBulkRetryNum.Inc()
+		// 退避期间响应 ctx.Done，避免退出时还在睡
+		select {
+		case <-time.After(backoff):
+		case <-r.ctx.Done():
+			return errors.Trace(r.ctx.Err())
+		}
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
 		}
 	}
 
-	return nil
+	return errors.Annotatef(lastErr, "bulk failed after %d attempts", maxRetry+1)
+}
+
+// recordBulkErrors 遇到 ES Errors=true 时走调：逐条记录失败项到指标与日志。
+// 返回失败条数，主要用于上层决策是否报错。
+func (r *River) recordBulkErrors(resp *elastic.BulkResponse) int {
+	failed := 0
+	for i := 0; i < len(resp.Items); i++ {
+		for action, item := range resp.Items[i] {
+			if len(item.Error) > 0 {
+				failed++
+				esBulkErrorNum.WithLabelValues(action, item.Index, strconv.Itoa(item.Status)).Inc()
+				log.Errorf("bulk item failed action=%s index=%s id=%s status=%d error=%s",
+					action, item.Index, item.ID, item.Status, string(item.Error))
+			}
+		}
+	}
+	return failed
 }
 
 // get mysql field value and convert it to specific value to es

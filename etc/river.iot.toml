@@ -16,25 +16,52 @@
 
 # ----- MySQL 连接 -----
 # 复制账号需要权限：SELECT, REPLICATION SLAVE, REPLICATION CLIENT
-# 生产部署用环境变量覆盖：MY_ADDR / MY_USER / MY_PASS，见 cmd/main.go 的 flag
-my_addr = "127.0.0.1:3306"
-my_user = "canal"
-my_pass = "changeme"
+# 推荐用 ${ENV} 占位符注入凭证，避免 toml 明文密码：
+#   docker run -e MY_PASS=xxx ...
+#   k8s secret -> envFrom
+# expandEnvVars 会在解析前替换，未设置的变量保留原字面不报错
+my_addr = "${MY_ADDR}"
+my_user = "${MY_USER}"
+my_pass = "${MY_PASS}"
 my_charset = "utf8mb4"
 
 # ----- Elasticsearch 连接 -----
 es_https = false
-es_addr = "127.0.0.1:9200"
-es_user = "elastic"
-es_pass = "changeme"
+es_addr = "${ES_ADDR}"
+es_user = "${ES_USER}"
+es_pass = "${ES_PASS}"
+
+# ----- ES TLS 配置（仅 es_https=true 时生效）-----
+# es_ca_file：私有 CA 证书路径，留空走系统根证书
+# es_insecure_skip_tls：默认 false，仅联调/自签证书快速验证可临时设 true
+# es_ca_file = "/etc/ssl/es-ca.pem"
+# es_insecure_skip_tls = false
+
+# ----- ES HTTP 客户端调优 -----
+# es_request_timeout：单次 bulk/索引请求超时，ES 故障时避免管道永久阻塞
+# es_max_idle_conns_per_host：连接池上限，bulk_size×流量 越大越要调高
+es_request_timeout = "30s"
+es_max_idle_conns_per_host = 32
 
 # ----- 状态存储 -----
 # master.info 持久化 binlog 位点，断点续传依赖此目录
 # 生产建议挂载到独立磁盘卷，避免容器重启丢位点
 data_dir = "/var/lib/go-mysql-es-iot"
+# master_fsync：写入 master.info 后强制 fsync 文件与父目录，保证断电不丢位点
+# 默认开启，性能极敏感场景可关（不推荐）
+# master_fsync = true
 
 # ----- 内置 HTTP 指标端点 -----
-# 暴露 /metrics（Prometheus 格式），含 mysql2es_inserted_num / canal_state / canal_delay
+# 暴露 /metrics（Prometheus 格式），核心指标：
+#   mysql2es_canal_state         同步状态 0/1
+#   mysql2es_canal_delay         主从延迟（秒）
+#   mysql2es_inserted/updated/deleted_num  按 index 累计文档数
+#   mysql2es_bulk_error_total    bulk 失败明细 (action,index,status)
+#   mysql2es_bulk_retry_total    bulk 整体重试次数
+#   mysql2es_bulk_duration_seconds  bulk 耗时分布
+#   mysql2es_sync_ch_size        内部 chan 占用，背压感知
+#   mysql2es_master_save_duration_seconds  master.info 落盘耗时
+# 生产强烈建议绑定 127.0.0.1 + 反代鉴权；容器场景按需 0.0.0.0
 stat_addr = "0.0.0.0:12800"
 stat_path = "/metrics"
 
@@ -56,6 +83,18 @@ skip_master_data = false
 # flush_bulk_time = "500ms"：500ms 内必刷一次，保证端到端延迟 < 1s
 bulk_size = 2000
 flush_bulk_time = "500ms"
+
+# ----- bulk 重试（应对 ES 抖动）-----
+# bulk_max_retry：单次 bulk 失败后的重试次数（指数退避），到顶后 cancel 退出
+# bulk_retry_initial_backoff：首次重试间隔，后续 ×2 直到 max
+# 例：1s -> 2s -> 4s -> 8s -> 16s -> 30s 上限封顶
+bulk_max_retry = 5
+bulk_retry_initial_backoff = "1s"
+bulk_retry_max_backoff = "30s"
+
+# ----- 内部 chan 容量 -----
+# 默认 4096，背压圈大；生产 5000+ qps 可调高到 8192
+sync_ch_size = 4096
 
 # ----- 安全开关 -----
 skip_no_pk_table = false

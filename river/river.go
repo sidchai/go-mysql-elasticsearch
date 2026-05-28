@@ -7,10 +7,10 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/juju/errors"
-	"github.com/siddontang/go-log/log"
 	"github.com/go-mysql-org/go-mysql/canal"
+	"github.com/juju/errors"
 	"github.com/sidchai/go-mysql-elasticsearch/elastic"
+	"github.com/siddontang/go-log/log"
 )
 
 // ErrRuleNotExist is the error if rule is not defined.
@@ -36,6 +36,18 @@ type River struct {
 	master *masterInfo
 
 	syncCh chan interface{}
+
+	// runningOnce 保证 canalSyncState=1 只被设一次，避免重复获取锁 / 重复记录启动时间
+	runningOnce sync.Once
+}
+
+// markRunning 首次被 OnRow 调用时设同步状态为 1，代表 binlog 端到端打通。
+// 跳出 P1-3 “未连上却报 1”均有的问题，以 OnRow 为可靠序点。
+func (r *River) markRunning() {
+	r.runningOnce.Do(func() {
+		canalSyncState.Set(1)
+		log.Infof("river is running: state=1")
+	})
 }
 
 // NewRiver creates the River from config
@@ -44,11 +56,13 @@ func NewRiver(c *Config) (*River, error) {
 
 	r.c = c
 	r.rules = make(map[string]*Rule)
-	r.syncCh = make(chan interface{}, 4096)
+	// P2-3：从配置读 chan 容量，applyDefaults 已保证 >0
+	r.syncCh = make(chan interface{}, c.SyncChSize)
 	r.ctx, r.cancel = context.WithCancel(context.Background())
 
 	var err error
-	if r.master, err = loadMasterInfo(c.DataDir); err != nil {
+	// P1-7：透传 fsync 开关到 masterInfo
+	if r.master, err = loadMasterInfo(c.DataDir, c.MasterFsyncEnabled()); err != nil {
 		return nil, errors.Trace(err)
 	}
 
@@ -69,14 +83,27 @@ func NewRiver(c *Config) (*River, error) {
 		return nil, errors.Trace(err)
 	}
 
-	cfg := new(elastic.ClientConfig)
-	cfg.Addr = r.c.ESAddr
-	cfg.User = r.c.ESUser
-	cfg.Password = r.c.ESPassword
-	cfg.HTTPS = r.c.ESHttps
-	r.es = elastic.NewClient(cfg)
+	// P0-2 / P0-4：透传 TLS/Timeout/连接池配置。NewClient 可能返回加载 CA 错误，必须向上传递。
+	cfg := &elastic.ClientConfig{
+		Addr:                r.c.ESAddr,
+		User:                r.c.ESUser,
+		Password:            r.c.ESPassword,
+		HTTPS:               r.c.ESHttps,
+		CAFile:              r.c.ESCAFile,
+		InsecureSkipTLS:     r.c.ESInsecureSkipTLS,
+		RequestTimeout:      r.c.ESRequestTimeout.Duration,
+		MaxIdleConnsPerHost: r.c.ESMaxIdleConnsPerHost,
+	}
+	if r.es, err = elastic.NewClient(cfg); err != nil {
+		return nil, errors.Annotate(err, "new es client")
+	}
 
-	go InitStatus(r.c.StatAddr, r.c.StatPath)
+	// P1-2：InitStatus 返回 error，启动失败记 fatal 日志但不阻断主流程（同步仍可运行）
+	go func() {
+		if err := InitStatus(r.c.StatAddr, r.c.StatPath); err != nil {
+			log.Errorf("metrics endpoint init failed: %v", err)
+		}
+	}()
 
 	return r, nil
 }
@@ -287,10 +314,17 @@ func ruleKey(schema string, table string) string {
 }
 
 // Run syncs the data from MySQL and inserts to ES.
+// P1-3：启动阶段不设 canalSyncState=1，该状态由 markRunning（首次 OnRow 抵达）控制。
+// P0-3：启动 collectMetrics goroutine 周期采样 canal_delay 与 syncCh 背压。
 func (r *River) Run() error {
 	r.wg.Add(1)
-	canalSyncState.Set(float64(1))
 	go r.syncLoop()
+
+	// P0-3：这个 goroutine 什么时候退出完全依赖 ctx，Close 中会 cancel
+	go r.collectMetrics(r.ctx)
+
+	// P1-6：启动 master.info 后台 flush goroutine
+	r.master.Run()
 
 	pos := r.master.Position()
 	if err := r.canal.RunFrom(pos); err != nil {
@@ -307,17 +341,19 @@ func (r *River) Ctx() context.Context {
 	return r.ctx
 }
 
-// Close closes the River
+// Close closes the River.
+// 退出顺序体现 graceful drain。
+//  1. cancel：让 OnRow / syncLoop 能从 select 退出，避免动不了；
+//  2. canal.Close：停止从 MySQL 拉取新的 binlog 事件；
+//  3. wg.Wait：等 syncLoop 走完 final flush + final SaveForce 后退出；
+//  4. master.Close：兼底再动一次 flushOnce，避免任何 dirty 未落盘。
 func (r *River) Close() {
 	log.Infof("closing river")
 
 	r.cancel()
-
 	r.canal.Close()
-
-	r.master.Close()
-
 	r.wg.Wait()
+	r.master.Close()
 }
 
 func isValidTables(tables []string) bool {

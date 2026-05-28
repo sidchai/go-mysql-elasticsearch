@@ -3,11 +3,15 @@ package elastic
 import (
 	"bytes"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"time"
 
 	"github.com/juju/errors"
 )
@@ -25,33 +29,83 @@ type Client struct {
 }
 
 // ClientConfig is the configuration for the client.
+// 安全与可靠性字段均为零值友好：默认 InsecureSkipTLS=false（严格校验），
+// RequestTimeout=0 表示使用上层传入的默认值（现为 30s）。
 type ClientConfig struct {
 	HTTPS    bool
 	Addr     string
 	User     string
 	Password string
+
+	// CAFile 可选 CA 证书路径；不为空时会加载并仅信任该 CA。
+	CAFile string
+	// InsecureSkipTLS 默认 false，仅联调/自签证书临时场景可设 true。
+	InsecureSkipTLS bool
+	// RequestTimeout 单次 HTTP 请求超时，防止 ES 挂死时永久阻塞。
+	RequestTimeout time.Duration
+	// MaxIdleConnsPerHost HTTP 连接池上限，高睁 bulk 场景调高可减少连接重建。
+	MaxIdleConnsPerHost int
 }
 
-// NewClient creates the Cient with configuration.
-func NewClient(conf *ClientConfig) *Client {
+// NewClient 创建 ES 客户端。
+// 较之后返回 error 的原因：加载 CA 证书可能失败（文件不存在/格式错误），
+// 不能静默丢揉，必须让调用方事先拿到明确错误。
+func NewClient(conf *ClientConfig) (*Client, error) {
 	c := new(Client)
 
 	c.Addr = conf.Addr
 	c.User = conf.User
 	c.Password = conf.Password
 
-	if conf.HTTPS {
-		c.Protocol = "https"
-		tr := &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		}
-		c.c = &http.Client{Transport: tr}
-	} else {
-		c.Protocol = "http"
-		c.c = &http.Client{}
+	timeout := conf.RequestTimeout
+	if timeout == 0 {
+		timeout = 30 * time.Second
+	}
+	maxIdle := conf.MaxIdleConnsPerHost
+	if maxIdle <= 0 {
+		maxIdle = 32
 	}
 
-	return c
+	// Transport 参数参考 net/http 默认值但针对高 QPS bulk 场景调优，避免频繁连接重建
+	tr := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   maxIdle,
+		MaxConnsPerHost:       maxIdle * 2,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+	}
+
+	if conf.HTTPS {
+		c.Protocol = "https"
+		tlsCfg := &tls.Config{
+			InsecureSkipVerify: conf.InsecureSkipTLS,
+			MinVersion:         tls.VersionTLS12,
+		}
+		if conf.CAFile != "" {
+			caPEM, err := os.ReadFile(conf.CAFile)
+			if err != nil {
+				return nil, errors.Annotatef(err, "read es ca file %s", conf.CAFile)
+			}
+			pool := x509.NewCertPool()
+			if !pool.AppendCertsFromPEM(caPEM) {
+				return nil, errors.Errorf("invalid ca file %s", conf.CAFile)
+			}
+			tlsCfg.RootCAs = pool
+		}
+		tr.TLSClientConfig = tlsCfg
+	} else {
+		c.Protocol = "http"
+	}
+
+	c.c = &http.Client{Transport: tr, Timeout: timeout}
+	return c, nil
 }
 
 // ResponseItem is the ES item in the response.

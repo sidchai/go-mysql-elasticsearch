@@ -1,1 +1,21 @@
 bin
+# 凭证：deploy/.env.example 之外的 .env 全部忽略
+.env
+deploy/.env
+# 用户自定义 toml（保留 etc/river.iot.toml 模板）
+etc/river.toml
+etc/river.local.toml
+# master.info 运行时产物
+var/
+data/
+*.master.info
+# IDE 与系统文件
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+# 构建产物
+dist/
+*.test
+*.out
+coverage.txt

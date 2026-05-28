@@ -1,0 +1,109 @@
+# =============================================================================
+# go-mysql-es-iot 单实例部署示例
+#
+# 用途：开发/演示环境快速拉起，与 iot_cloud_platform_server/api_request_record_es_deployment.md 配套
+# 生产建议：systemd / k8s Deployment + 独立 master.info 持久卷 + Prometheus ServiceMonitor
+#
+# 使用方式：
+#   1. 复制 .env.example 为 .env，填入 MySQL/ES 凭证
+#   2. docker compose up -d
+#   3. 验证 metrics: curl http://localhost:12800/metrics | grep mysql2es_canal_state
+# =============================================================================
+
+services:
+  go-mysql-es-iot:
+    image: ghcr.io/sidchai/go-mysql-elasticsearch:latest
+    container_name: go-mysql-es-iot
+    restart: unless-stopped
+
+    # 凭证全部通过环境变量注入，toml 中用 ${VAR} 占位符接收
+    environment:
+      MY_ADDR: ${MY_ADDR:-mysql:3306}
+      MY_USER: ${MY_USER:-canal}
+      MY_PASS: ${MY_PASS:?must set MY_PASS}
+      ES_ADDR: ${ES_ADDR:-elasticsearch:9200}
+      ES_USER: ${ES_USER:-elastic}
+      ES_PASS: ${ES_PASS:?must set ES_PASS}
+      TZ: Asia/Shanghai
+
+    # master.info 必须持久化，否则容器重启会从头全量
+    volumes:
+      - go-mysql-es-iot-data:/var/lib/go-mysql-es-iot
+      # 配置文件挂载示例（需自定义时取消注释，参考 etc/river.iot.toml）
+      # - ./river.toml:/etc/go-mysql-es-iot/river.toml:ro
+
+    ports:
+      # 仅暴露给本机 Prometheus 拉取，生产请绑定内网 IP 或走 service mesh
+      - "127.0.0.1:12800:12800"
+
+    # 健康检查继承自 Dockerfile，30s 探测一次 mysql2es_canal_state=1
+    healthcheck:
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+
+    # 资源限制：4G 机器友好，bulk_size=2000 + sync_ch_size=4096 实测峰值 < 300MB
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+        reservations:
+          memory: 128M
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+    # 等待 MySQL 与 ES 启动后再启动同步
+    # 注意：depends_on 只保证启动顺序，不保证服务真正可用，go-mysql 内部有重连机制
+    depends_on:
+      - mysql
+      - elasticsearch
+
+  # ============ 以下为开发环境示例，生产请连接真实集群 ============
+
+  mysql:
+    image: mysql:8.0
+    container_name: mysql-dev
+    profiles: ["dev"]   # 默认不启动，用 docker compose --profile dev up 才拉起
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+      MYSQL_DATABASE: iot_cloud
+    command: >
+      --server-id=1
+      --log-bin=mysql-bin
+      --binlog-format=ROW
+      --binlog-row-image=FULL
+      --expire-logs-days=7
+      --gtid-mode=ON
+      --enforce-gtid-consistency=ON
+    volumes:
+      - mysql-data:/var/lib/mysql
+    ports:
+      - "127.0.0.1:3306:3306"
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.4.1
+    container_name: es-dev
+    profiles: ["dev"]
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms1g -Xmx1g"
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    ports:
+      - "127.0.0.1:9200:9200"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+
+volumes:
+  go-mysql-es-iot-data:
+  mysql-data:
+  es-data:

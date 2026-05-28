@@ -54,9 +54,11 @@ WORKDIR /var/lib/go-mysql-es-iot
 # 12800：Prometheus metrics 端点（与 river.iot.toml 中 stat_addr 一致）
 EXPOSE 12800
 
-# 健康检查：用内置 metrics 端点，30s 探测一次
-HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD wget -q -O - http://127.0.0.1:12800/metrics 2>&1 | grep -q mysql2es_canal_state || exit 1
+# 健康检查：检查 mysql2es_canal_state 必须为 1（真实同步运行中）
+# 原 grep -q mysql2es_canal_state 只判断指标存在，state=0（停止/异常）也算 healthy 是错的
+# start-period 留 120s：全量阶段（mysqldump）期间 canal 还没消费 binlog，state=0 是正常的
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
+    CMD wget -q -O - http://127.0.0.1:12800/metrics 2>&1 | grep -E '^mysql2es_canal_state 1$' || exit 1
 
 ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/go-mysql-elasticsearch"]
 CMD ["-config=/etc/go-mysql-es-iot/river.toml"]

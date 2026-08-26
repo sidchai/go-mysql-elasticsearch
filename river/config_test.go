@@ -94,6 +94,43 @@ func TestMasterFsyncEnabled(t *testing.T) {
 	}
 }
 
+// TestUseGTIDEnabled 验证三态：未设置=true（云库默认 GTID）、显式 true/false。
+func TestUseGTIDEnabled(t *testing.T) {
+	tt := true
+	ff := false
+	cases := []struct {
+		name string
+		ptr  *bool
+		want bool
+	}{
+		{"nil_default_true", nil, true},
+		{"explicit_true", &tt, true},
+		{"explicit_false", &ff, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Config{UseGTID: tc.ptr}
+			if got := c.UseGTIDEnabled(); got != tc.want {
+				t.Errorf("UseGTIDEnabled() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestNewConfigUseGTIDToml 验证 toml 显式 false 能关掉 GTID 订阅。
+func TestNewConfigUseGTIDToml(t *testing.T) {
+	cfg, err := NewConfig(`
+my_addr = "127.0.0.1:3306"
+use_gtid = false
+`)
+	if err != nil {
+		t.Fatalf("NewConfig err: %v", err)
+	}
+	if cfg.UseGTIDEnabled() {
+		t.Errorf("use_gtid=false still enabled")
+	}
+}
+
 // TestNewConfigEnvExpansion 端到端验证：toml 文本中的 ${VAR} 被解析前替换
 func TestNewConfigEnvExpansion(t *testing.T) {
 	t.Setenv("MY_TEST_PASS", "from_env")

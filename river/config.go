@@ -69,6 +69,10 @@ type Config struct {
 	// MasterFsync 默认 true；写入 master.info 后强制 fsync，避免断电丢位点。
 	// 性能敏感场景可关闭，个人不推荐。
 	MasterFsync *bool `toml:"master_fsync"`
+
+	// UseGTID 默认 true：用 COM_BINLOG_DUMP_GTID 订阅，主从切换/变配后面位点仍能续上。
+	// 未开 gtid_mode 的实例显式设 false，回退文件名+位点。
+	UseGTID *bool `toml:"use_gtid"`
 }
 
 // envVarPattern 匹配 ${VAR} 占位符（仅字母/数字/下划线），用于对 toml 里的凭证做环境变量替换。
@@ -138,6 +142,14 @@ func (c *Config) MasterFsyncEnabled() bool {
 		return true
 	}
 	return *c.MasterFsync
+}
+
+// UseGTIDEnabled 返回是否用 GTID 订阅 binlog。默认 true，对齐 MySQL 8 云库 gtid_mode=ON。
+func (c *Config) UseGTIDEnabled() bool {
+	if c.UseGTID == nil {
+		return true
+	}
+	return *c.UseGTID
 }
 
 // TomlDuration supports time codec for TOML format.

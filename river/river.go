@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/go-mysql-org/go-mysql/canal"
+	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/juju/errors"
 	"github.com/sidchai/go-mysql-elasticsearch/elastic"
 	"github.com/siddontang/go-log/log"
@@ -326,14 +327,74 @@ func (r *River) Run() error {
 	// P1-6：启动 master.info 后台 flush goroutine
 	r.master.Run()
 
-	pos := r.master.Position()
-	if err := r.canal.RunFrom(pos); err != nil {
+	if err := r.startCanal(); err != nil {
 		log.Errorf("start canal err %v", err)
 		canalSyncState.Set(0)
 		return errors.Trace(err)
 	}
 
 	return nil
+}
+
+// startCanal 按 use_gtid 选择订阅协议。
+// GTID 走 COM_BINLOG_DUMP_GTID（云监控要求 auto-position）；关闭则沿用文件名+位点。
+func (r *River) startCanal() error {
+	if !r.c.UseGTIDEnabled() {
+		pos := r.master.Position()
+		log.Infof("start canal from binlog position %s (use_gtid=false)", pos)
+		return r.canal.RunFrom(pos)
+	}
+
+	gset, err := r.resolveStartGTID()
+	if err != nil {
+		return err
+	}
+	log.Infof("start canal from GTID set (COM_BINLOG_DUMP_GTID) %s", gset)
+	return r.canal.StartFromGTID(gset)
+}
+
+func (r *River) flavor() string {
+	if r.c != nil && r.c.Flavor != "" {
+		return r.c.Flavor
+	}
+	return mysql.MySQLFlavor
+}
+
+// resolveStartGTID 决定 GTID 续订起点：
+//  1. master.info 已有 gtid_set → 断点续传；
+//  2. 否则取当前 GTID_EXECUTED（从文件位点升级、或首次无 dump 启动）。
+//
+// 第 2 路只保证「已追上」的实例无缺口；若还在追很老的 binlog 文件，请先追上或手工写入 gtid_set。
+func (r *River) resolveStartGTID() (mysql.GTIDSet, error) {
+	flavor := r.flavor()
+	if saved := r.master.GTIDSet(); saved != "" {
+		gset, err := mysql.ParseGTIDSet(flavor, saved)
+		if err != nil {
+			return nil, errors.Annotate(err, "parse master.info gtid_set")
+		}
+		return gset, nil
+	}
+
+	gset, err := r.canal.GetMasterGTIDSet()
+	if err != nil {
+		return nil, errors.Annotate(err, "query GTID_EXECUTED (use_gtid=true requires gtid_mode=ON; otherwise set use_gtid=false)")
+	}
+	if gset == nil || gset.IsEmpty() {
+		return nil, errors.New("master GTID_EXECUTED is empty; set use_gtid=false to use file position")
+	}
+	log.Warnf("master.info has no gtid_set, start from current GTID_EXECUTED (caught-up replica has no gap)")
+	return gset, nil
+}
+
+// syncedGTID 读 canal 内存里的已执行集合；尚未收到 GTID 事件时返回空串。
+func (r *River) syncedGTID() string {
+	if r.canal == nil {
+		return ""
+	}
+	if gs := r.canal.SyncedGTIDSet(); gs != nil {
+		return gs.String()
+	}
+	return ""
 }
 
 // Ctx returns the internal context for outside use.

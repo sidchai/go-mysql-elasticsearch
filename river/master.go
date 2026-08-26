@@ -25,6 +25,8 @@ type masterInfo struct {
 
 	Name string `toml:"bin_name"`
 	Pos  uint32 `toml:"bin_pos"`
+	// GTID 已执行集合，COM_BINLOG_DUMP_GTID 续订依赖此字段；老 master.info 无此键时为空。
+	GTID string `toml:"gtid_set"`
 
 	filePath string
 
@@ -115,34 +117,41 @@ func (m *masterInfo) flushOnce() error {
 		m.Unlock()
 		return nil
 	}
-	pos := mysql.Position{Name: m.Name, Pos: m.Pos}
+	name, pos, gtid := m.Name, m.Pos, m.GTID
 	m.Unlock()
-	return m.persist(pos)
+	return m.persist(name, pos, gtid)
 }
 
 // Save 更新内存中的最新位点并标记 dirty，实际落盘交给 flushLoop。
-// 原实现会静默丢弃高频调用，现在仅更新内存，flushLoop 会拿到“最新的”位点营救。
-func (m *masterInfo) Save(pos mysql.Position) error {
+// gtid 为空时保留已有 GTID，避免 canal 尚未吐出 GTID 事件时把已落盘集合冲掉。
+func (m *masterInfo) Save(pos mysql.Position, gtid string) error {
 	m.Lock()
 	m.Name = pos.Name
 	m.Pos = pos.Pos
+	if gtid != "" {
+		m.GTID = gtid
+	}
 	m.dirty = true
 	m.Unlock()
 	return nil
 }
 
 // SaveForce 立即同步落盘，不走 flushLoop。用于退出前的 final flush 场景。
-func (m *masterInfo) SaveForce(pos mysql.Position) error {
+func (m *masterInfo) SaveForce(pos mysql.Position, gtid string) error {
 	m.Lock()
 	m.Name = pos.Name
 	m.Pos = pos.Pos
+	if gtid != "" {
+		m.GTID = gtid
+	}
+	name, p, g := m.Name, m.Pos, m.GTID
 	m.dirty = true
 	m.Unlock()
-	return m.persist(pos)
+	return m.persist(name, p, g)
 }
 
 // persist 是唯一的落盘实现，使用临时文件 + rename + fsync 保证原子性与持久性。
-func (m *masterInfo) persist(pos mysql.Position) error {
+func (m *masterInfo) persist(name string, pos uint32, gtid string) error {
 	start := time.Now()
 	defer func() {
 		masterSaveDuration.Observe(time.Since(start).Seconds())
@@ -151,8 +160,9 @@ func (m *masterInfo) persist(pos mysql.Position) error {
 	var buf bytes.Buffer
 	enc := toml.NewEncoder(&buf)
 	if err := enc.Encode(map[string]interface{}{
-		"bin_name": pos.Name,
-		"bin_pos":  pos.Pos,
+		"bin_name": name,
+		"bin_pos":  pos,
+		"gtid_set": gtid,
 	}); err != nil {
 		return errors.Trace(err)
 	}
@@ -202,7 +212,7 @@ func (m *masterInfo) persist(pos mysql.Position) error {
 	m.dirty = false
 	m.Unlock()
 
-	log.Debugf("masterInfo persisted %s:%d", pos.Name, pos.Pos)
+	log.Debugf("masterInfo persisted %s:%d gtid=%s", name, pos, gtid)
 	return nil
 }
 
@@ -214,6 +224,13 @@ func (m *masterInfo) Position() mysql.Position {
 		Name: m.Name,
 		Pos:  m.Pos,
 	}
+}
+
+// GTIDSet 返回已持久化的 GTID 集合字符串，空串表示尚未拿到 GTID。
+func (m *masterInfo) GTIDSet() string {
+	m.RLock()
+	defer m.RUnlock()
+	return m.GTID
 }
 
 func (m *masterInfo) Close() error {

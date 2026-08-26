@@ -200,7 +200,7 @@ func (r *River) syncLoop() {
 				}
 			}
 			if lastKnownPos.Name != "" {
-				if err := r.master.SaveForce(lastKnownPos); err != nil {
+				if err := r.master.SaveForce(lastKnownPos, r.syncedGTID()); err != nil {
 					log.Errorf("final save position %s err: %v", lastKnownPos, err)
 				}
 			}
@@ -218,7 +218,7 @@ func (r *River) syncLoop() {
 		}
 
 		if needSavePos {
-			if err := r.master.Save(pos); err != nil {
+			if err := r.master.Save(pos, r.syncedGTID()); err != nil {
 				log.Errorf("save sync position %s err %v, close sync", pos, err)
 				canalSyncState.Set(0)
 				r.cancel()

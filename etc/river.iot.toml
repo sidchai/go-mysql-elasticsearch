@@ -70,6 +70,11 @@ stat_path = "/metrics"
 # 建议命名规则：业务 ID + 实例序号，例如 iot 项目固定 50xx 段
 server_id = 5001
 flavor = "mysql"
+# use_gtid：COM_BINLOG_DUMP_GTID（auto-position）。云库变配/主从切换后面位点会变，
+# 必须开；未开 gtid_mode 才设 false。默认 true。
+# 从老 master.info（只有 bin_name/bin_pos）升级时：若 Dump 已 waiting for more updates，
+# 首次会用当前 GTID_EXECUTED 续订，无缺口。
+use_gtid = true
 
 # ----- mysqldump 初次全量 -----
 # 历史数据通过 mysqldump 引导，需保证宿主存在 mysqldump 8.x 二进制

@@ -90,6 +90,8 @@ func (s *riverTestSuite) SetUpSuite(c *C) {
 
 	cfg.BulkSize = 1
 	cfg.FlushBulkTime = TomlDuration{3 * time.Millisecond}
+	useGTID := false
+	cfg.UseGTID = &useGTID
 
 	os.RemoveAll(cfg.DataDir)
 

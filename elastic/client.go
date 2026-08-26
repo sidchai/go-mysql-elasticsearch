@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/juju/errors"
@@ -241,14 +242,30 @@ type Mapping map[string]struct {
 }
 
 // DoRequest sends a request with body to ES.
-// 针对 ES 8/9 处理：增加 Accept compatible-with=8 头，
-// 保证能应对 ES 9.x 在严格模式下拒绝旧请求的场景。
-func (c *Client) DoRequest(method string, url string, body *bytes.Buffer) (*http.Response, error) {
-	req, err := http.NewRequest(method, url, body)
+// 针对 ES 8/9 兼容模式处理：
+//   - Accept 与 Content-Type 必须成对使用 vendor type 且 compatible-with 版本一致，
+//     ES 9.x 强制校验（仅一边带 compatible-with 会返回 media_type_header_exception，
+//     报错原文：A compatible version is required on both Content-Type and Accept headers）
+//   - bulk 端点：Content-Type 用 application/vnd.elasticsearch+x-ndjson;compatible-with=8
+//   - 其他端点：Content-Type 用 application/vnd.elasticsearch+json;compatible-with=8
+//
+// compatible-with=8 在 ES 9 表示"按 ES 8 响应格式返回"（保留 fork 仓库的多版本兼容设计），
+// 在 ES 8 等同于原生格式（同版本兼容标签 no-op），所以 ES 8/9 集群都能工作。
+//
+// 形参命名 reqURL 而非 url，避免遮蔽 import 的 net/url 包。
+func (c *Client) DoRequest(method string, reqURL string, body *bytes.Buffer) (*http.Response, error) {
+	req, err := http.NewRequest(method, reqURL, body)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	req.Header.Set("Content-Type", "application/json")
+
+	// bulk 端点固定后缀 /_bulk（可能为 /_bulk 或 /{index}/_bulk），
+	// 用 url.Parse 取 Path 段判断，防止 query string（如 ?refresh=true）误判
+	contentType := "application/vnd.elasticsearch+json;compatible-with=8"
+	if parsed, perr := url.Parse(reqURL); perr == nil && strings.HasSuffix(parsed.Path, "/_bulk") {
+		contentType = "application/vnd.elasticsearch+x-ndjson;compatible-with=8"
+	}
+	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("Accept", "application/vnd.elasticsearch+json;compatible-with=8")
 	if len(c.User) > 0 && len(c.Password) > 0 {
 		req.SetBasicAuth(c.User, c.Password)
